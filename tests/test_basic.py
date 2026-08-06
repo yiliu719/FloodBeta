@@ -10,13 +10,15 @@ Run with output visible:
     python -m pytest tests/ -s
 """
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import requests
 from geopy.exc import GeocoderTimedOut
 
-from floodbeta import edgar, geocoder
+from floodbeta import edgar, geocoder, scorer
 from floodbeta.providers import base, fema
 
 # Hero demo ticker and validation ticker. Tesla's Gigafactories should surface
@@ -431,6 +433,221 @@ def test_provider_implements_the_base_interface():
 
     assert isinstance(provider, base.FloodDataProvider)
     assert provider.get_provider_name() == "FEMA"
+
+
+# --- Scoring, offline (no network) -------------------------------------------
+
+
+def _point(risk_score, geocoded=True, source="FEMA"):
+    return {
+        "lat": 30.0,
+        "lon": -97.0,
+        "risk_score": risk_score,
+        "risk_label": "High",
+        "source": source,
+        "raw": {},
+        "geocoded": geocoded,
+    }
+
+
+def test_score_is_the_unweighted_mean():
+    result = scorer.calculate_floodbeta([_point(1.0), _point(0.05), _point(0.3)])
+
+    assert result["score"] == pytest.approx(0.45)
+    assert result["facility_count"] == 3
+    assert result["geocoded_count"] == 3
+    assert result["provider"] == "FEMA"
+
+
+def test_failed_geocodes_are_excluded_from_the_mean():
+    """A data gap must not be averaged in as if it were a measurement."""
+    scored_only = scorer.calculate_floodbeta([_point(1.0), _point(1.0)])
+    with_failure = scorer.calculate_floodbeta(
+        [_point(1.0), _point(1.0), _point(0.1, geocoded=False)]
+    )
+
+    assert with_failure["score"] == scored_only["score"] == 1.0
+    assert with_failure["facility_count"] == 3
+    assert with_failure["geocoded_count"] == 2
+
+
+def test_zero_geocoded_facilities_yields_no_score():
+    result = scorer.calculate_floodbeta(
+        [_point(0.1, geocoded=False), _point(0.1, geocoded=False)]
+    )
+
+    assert result["score"] is None
+    assert result["label"] == "Insufficient data"
+    assert result["facility_count"] == 2
+    assert result["geocoded_count"] == 0
+
+
+def test_empty_input_yields_no_score():
+    result = scorer.calculate_floodbeta([])
+
+    assert result["score"] is None
+    assert result["label"] == "Insufficient data"
+    assert result["facility_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "score,expected",
+    [
+        (0.0, "Low"),
+        (0.05, "Low"),
+        (0.199, "Low"),
+        (0.2, "Moderate"),  # bands are half-open
+        (0.35, "Moderate"),
+        (0.499, "Moderate"),
+        (0.5, "High"),
+        (1.0, "High"),
+    ],
+)
+def test_score_bands(score, expected):
+    assert scorer.label_for_score(score) == expected
+
+
+def test_breakdown_passes_input_through_unmodified():
+    points = [_point(1.0), _point(0.05, geocoded=False)]
+
+    result = scorer.calculate_floodbeta(points)
+
+    assert result["breakdown"] == points
+
+
+def test_points_without_a_geocoded_key_are_scored():
+    """RiskPoint per base.py has no `geocoded` field; absent means present."""
+    bare = {
+        "lat": 30.0,
+        "lon": -97.0,
+        "risk_score": 1.0,
+        "risk_label": "High",
+        "source": "FEMA",
+        "raw": {},
+    }
+
+    result = scorer.calculate_floodbeta([bare])
+
+    assert result["score"] == 1.0
+    assert result["geocoded_count"] == 1
+
+
+def test_multiple_providers_are_both_attributed():
+    result = scorer.calculate_floodbeta(
+        [_point(1.0, source="FEMA"), _point(0.0, source="First Street")]
+    )
+
+    assert result["provider"] == "FEMA, First Street"
+
+
+def _code_without_docstrings(module):
+    """Module source minus docstrings and comments.
+
+    Prose legitimately names the things the code must not contain — the
+    docstring says "no depth values" — so only executable code is checked.
+    String literals are kept: a leaked `if zone == "AE"` must still be seen.
+    """
+    tree = ast.parse(Path(module.__file__).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                node.body.pop(0)
+    return ast.unparse(tree)  # also drops comments
+
+
+def test_scorer_module_contains_no_provider_specific_logic():
+    """Layer separation is a hard architectural rule in CLAUDE.md."""
+    code = _code_without_docstrings(scorer)
+
+    for forbidden in [
+        "FLD_ZONE",
+        "ZONE_SUBTY",
+        "floodway",
+        "NFHL",
+        "fema",
+        "inundation",
+        "depth",
+    ]:
+        assert forbidden.lower() not in code.lower(), (
+            f"{forbidden!r} leaked into scorer.py"
+        )
+
+
+# --- End-to-end pipeline -----------------------------------------------------
+
+
+def test_end_to_end_tsla_pipeline():
+    """Ticker -> edgar -> geocoder -> FEMA -> scorer, printed for review."""
+    report = edgar.get_facility_report("$TSLA")
+    facilities = report["facilities"]
+    geocoded = geocoder.geocode_addresses(report["addresses"])
+
+    if all("Blocked" in g.get("error", "") for g in geocoded):
+        pytest.skip(
+            "Nominatim returned 403 for every address — this IP is blocked by "
+            "its usage policy. Re-run from a normal network for the full pipeline."
+        )
+
+    provider = fema.FEMAFloodProvider()
+    risk_points = []
+    for location in geocoded:
+        if location["geocoded"]:
+            point = provider.get_risk_point(location["lat"], location["lon"])
+            point["geocoded"] = True
+        else:
+            # Placeholder so facility_count still reflects the full asset base.
+            point = {
+                "lat": None,
+                "lon": None,
+                "risk_score": None,
+                "risk_label": "Unknown",
+                "source": provider.get_provider_name(),
+                "raw": {"error": location.get("error", "geocoding failed")},
+                "geocoded": False,
+            }
+        risk_points.append(point)
+
+    result = scorer.calculate_floodbeta(risk_points)
+
+    print(f"\n{'=' * 78}")
+    print(f"{report['ticker']} — {report['company']}")
+    print(f"{report['form']} filed {report['filing_date']}  |  {result['provider']}")
+    print(f"{'=' * 78}")
+    print(f"{'facility':<22} {'location':<24} {'zone':<7} {'score':>6}  label")
+    print(f"{'-' * 78}")
+    for facility, point in zip(facilities, risk_points):
+        attributes = (point["raw"].get("features") or [{}])[0].get("attributes", {})
+        zone = attributes.get("FLD_ZONE") or "—"
+        score = "—" if point["risk_score"] is None else f"{point['risk_score']:.2f}"
+        print(
+            f"{(facility['name'] or '—'):<22} {facility['location']:<24} "
+            f"{zone:<7} {score:>6}  {point['risk_label']}"
+        )
+    print(f"{'-' * 78}")
+    print(
+        f"FloodBeta: {result['score']}  ({result['label']})   "
+        f"{result['geocoded_count']}/{result['facility_count']} facilities scored"
+    )
+    print(f"{'=' * 78}")
+
+    assert result["facility_count"] == len(facilities)
+    assert set(result) == {
+        "score",
+        "label",
+        "facility_count",
+        "geocoded_count",
+        "provider",
+        "breakdown",
+    }
+    assert result["breakdown"] == risk_points
+    if result["geocoded_count"]:
+        assert 0.0 <= result["score"] <= 1.0
+        assert result["label"] in ("Low", "Moderate", "High")
 
 
 def test_user_agent_defaults_and_reads_env(monkeypatch):
