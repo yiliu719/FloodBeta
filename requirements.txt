@@ -1,0 +1,9 @@
+streamlit==1.61.1
+requests==2.34.2
+geopy==2.5.0
+pandas==3.0.5
+pydeck==0.9.3
+python-dotenv==1.2.2
+
+# Dev / test
+pytest==9.1.1
