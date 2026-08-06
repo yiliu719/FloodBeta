@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "python*",
+      "pytest*",
+      "pip install*",
+      "cat*",
+      "ls*",
+      "find*",
+      "grep*",
+      "git status*",
+      "git diff*",
+      "git log*",
+      "git add*"
+    ],
+    "ask": [
+      "git commit*",
+      "git push*",
+      "rm*",
+      "mv*"
+    ],
+    "deny": [
+      "rm -rf*"
+    ]
+  }
+}
