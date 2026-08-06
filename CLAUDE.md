@@ -16,7 +16,9 @@ FloodBeta is a physical climate risk screener for public equities. It takes a st
 - **Frontend:** Streamlit
 - **Data sources:**
   - SEC EDGAR full-text search API (free, no key required) for 10-K filings
-  - FEMA Flood Map Service Center API (free, no key required) — primary flood data provider
+  - FEMA National Flood Hazard Layer (NFHL) REST API (free, no key required) — primary flood data provider
+    - Endpoint: `https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query` (layer 28 = "Flood Hazard Zones")
+    - **Not** `msc.fema.gov` — that host serves the human-facing Map Service Center website and returns `Service not found` for this path
   - `geopy` with Nominatim geocoder for address → lat/lon
 - **Key libraries:** `streamlit`, `requests`, `geopy`, `pandas`, `pydeck` (for map viz), `python-dotenv`
 
@@ -59,23 +61,38 @@ This is where provider-specific logic lives — zone names, depth values, raster
 # providers/base.py — normalized output schema every provider must return
 # This is the ONLY format scorer.py ever sees
 
-RiskPoint = {
-    "lat": float,           # Facility latitude
-    "lon": float,           # Facility longitude
-    "risk_score": float,    # 0.0 (no risk) → 1.0 (highest risk) — provider normalized
-    "risk_label": str,      # Human-readable: "Low" / "Moderate" / "High" / "Unknown"
-    "source": str,          # Provider name e.g. "FEMA", "First Street"
-    "raw": dict             # Raw provider output, preserved for debugging/transparency
-}
+from typing import TypedDict
+
+# Risk labels a provider may emit. Kept here, not in scorer.py, so every
+# provider agrees on the vocabulary.
+RISK_LABELS = ("Low", "Moderate", "High", "Unknown")
+
+
+class RiskPoint(TypedDict):
+    """Normalized per-facility risk record."""
+
+    lat: float          # Facility latitude
+    lon: float          # Facility longitude
+    risk_score: float   # 0.0 (no risk) -> 1.0 (highest risk), provider normalized
+    risk_label: str     # Human-readable: "Low" / "Moderate" / "High" / "Unknown"
+    source: str         # Provider name e.g. "FEMA", "First Street"
+    raw: dict           # Raw provider output, preserved for debugging/transparency
+
 
 # Abstract base class — all providers must implement this
 class FloodDataProvider:
+    """Interface every flood data provider must implement."""
+
     def get_risk_point(self, lat: float, lon: float) -> RiskPoint:
         raise NotImplementedError
 
     def get_provider_name(self) -> str:
         raise NotImplementedError
 ```
+
+`RiskPoint` is a `TypedDict`, so it is a plain `dict` at runtime — providers
+build and return dict literals as before, and the annotation only documents
+and type-checks the shape. `risk_label` must be one of `RISK_LABELS`.
 
 ### Layer 2 — FloodBeta scoring (provider-agnostic, lives in scorer.py)
 scorer.py receives a list of RiskPoints and aggregates them into a single FloodBeta score.
@@ -95,16 +112,40 @@ FloodBeta score ranges:
 
 ## Provider-Specific Normalization Rules
 
-### FEMA Flood Map Service Center (current)
-FEMA outputs categorical flood zone labels. Normalize to risk_score as follows:
+### FEMA National Flood Hazard Layer (current)
+FEMA outputs categorical flood zone labels in `FLD_ZONE`, with a `ZONE_SUBTY`
+qualifier. Normalize to risk_score as follows:
 
 | FEMA Zone | Description | risk_score |
 |-----------|-------------|------------|
-| AE, A, AO, AH, A1-30 | 100-year floodplain | 1.0 |
-| AE (floodway) | Highest velocity flood path | 1.0 |
+| AE, A, AO, AH, A1-30 | 100-year floodplain (SFHA) | 1.0 |
+| AE (floodway) | Highest velocity flood path — arrives as `FLD_ZONE=AE` + `ZONE_SUBTY=FLOODWAY` | 1.0 |
+| V, VE, V1-30 | Coastal high hazard — SFHA *with* wave action | 1.0 |
+| AR, A99 | SFHA pending or behind planned protection | 1.0 |
 | X (shaded) / B | 500-year / moderate risk | 0.3 |
+| X (levee-protected) | Dry only because a levee holds — residual risk is real | 0.3 |
 | X (unshaded) / C | Minimal risk | 0.05 |
-| Unknown / undetermined | No data | 0.1 |
+| D / "AREA NOT INCLUDED" / unrecognized / no data | Undetermined | 0.1 |
+
+**Zone X requires reading `ZONE_SUBTY`** — the zone code alone cannot separate
+the three X cases. Treat X as 0.3 when the subtype contains `0.2 PCT` (the
+500-year floodplain) or `LEVEE` (e.g. `AREA WITH REDUCED FLOOD RISK DUE TO
+LEVEE`); otherwise 0.05.
+
+Zone matching is case- and whitespace-insensitive. Numbered legacy zones
+(A1-A30, V1-V30) come from older FIRMs and are equivalent to their unnumbered
+forms.
+
+**Overlapping polygons resolve to the highest risk present.** A point on a
+zone boundary can intersect several polygons; the query returns all of them
+and the provider takes the maximum risk_score rather than whichever the
+service happened to list first. Flood screening should err conservative.
+
+**ArcGIS reports failures with HTTP 200 and an `error` key in the body**, so
+the status code alone is not a success signal. Any failure — network error,
+error body, malformed JSON, or a point outside NFHL coverage — yields
+risk_score 0.1 / "Unknown", never an exception. Note that no coverage means
+*no data*, which is not the same as low risk.
 
 ### Future providers — inundation depth / water surface elevation rasters
 Providers like First Street Foundation, NOAA inundation models, and USGS flood products
