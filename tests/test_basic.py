@@ -18,7 +18,7 @@ import pytest
 import requests
 from geopy.exc import GeocoderTimedOut
 
-from floodbeta import edgar, geocoder, scorer
+from floodbeta import edgar, flood_data, geocoder, scorer
 from floodbeta.providers import base, fema
 
 # Hero demo ticker and validation ticker. Tesla's Gigafactories should surface
@@ -541,13 +541,18 @@ def test_multiple_providers_are_both_attributed():
 
 
 def _code_without_docstrings(module):
-    """Module source minus docstrings and comments.
+    """Module source minus docstrings and comments."""
+    return _code_without_docstrings_from_path(Path(module.__file__))
+
+
+def _code_without_docstrings_from_path(path):
+    """Source at `path` minus docstrings and comments.
 
     Prose legitimately names the things the code must not contain — the
     docstring says "no depth values" — so only executable code is checked.
     String literals are kept: a leaked `if zone == "AE"` must still be seen.
     """
-    tree = ast.parse(Path(module.__file__).read_text())
+    tree = ast.parse(Path(path).read_text())
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef)):
             first = node.body[0] if node.body else None
@@ -578,6 +583,151 @@ def test_scorer_module_contains_no_provider_specific_logic():
         )
 
 
+# --- flood_data orchestration ------------------------------------------------
+
+
+def test_flood_data_risk_points_for_tsla_addresses():
+    """Print the full RiskPoint produced for each TSLA facility."""
+    provider = fema.FEMAFloodProvider()
+    risk_points = flood_data.get_risk_points(TSLA_ADDRESSES, provider)
+
+    print(f"\n{'=' * 78}")
+    print(f"flood_data.get_risk_points — {len(TSLA_ADDRESSES)} TSLA addresses")
+    print(f"{'=' * 78}")
+    for address, point in zip(TSLA_ADDRESSES, risk_points):
+        print(f"\n{address}")
+        print(f"  lat        : {point['lat']}")
+        print(f"  lon        : {point['lon']}")
+        print(f"  risk_score : {point['risk_score']}")
+        print(f"  risk_label : {point['risk_label']}")
+        print(f"  source     : {point['source']}")
+        print(f"  geocoded   : {point['geocoded']}")
+        features = point["raw"].get("features")
+        if features:
+            print(f"  raw        : {features[0].get('attributes')}")
+        else:
+            print(f"  raw        : {point['raw']}")
+    print(f"\n{'=' * 78}")
+
+    assert len(risk_points) == len(TSLA_ADDRESSES)
+    for point in risk_points:
+        assert set(point) == {
+            "lat",
+            "lon",
+            "risk_score",
+            "risk_label",
+            "source",
+            "raw",
+            "geocoded",
+        }
+        assert point["source"] == "FEMA"
+        assert point["risk_label"] in base.RISK_LABELS
+        assert 0.0 <= point["risk_score"] <= 1.0
+
+
+class _StubProvider(base.FloodDataProvider):
+    def get_provider_name(self):
+        return "STUB"
+
+    def get_risk_point(self, lat, lon):
+        return {
+            "lat": lat,
+            "lon": lon,
+            "risk_score": 1.0,
+            "risk_label": "High",
+            "source": "STUB",
+            "raw": {},
+        }
+
+
+def _patch_geocoder(monkeypatch, results):
+    monkeypatch.setattr(geocoder, "geocode_addresses", lambda addresses: results)
+
+
+def test_successful_geocode_gets_geocoded_true(monkeypatch):
+    _patch_geocoder(
+        monkeypatch,
+        [{"address": "Austin, Texas", "lat": 30.2, "lon": -97.7, "geocoded": True}],
+    )
+
+    points = flood_data.get_risk_points(["Austin, Texas"], _StubProvider())
+
+    assert points[0]["geocoded"] is True
+    assert points[0]["risk_score"] == 1.0
+
+
+def test_failed_geocode_becomes_an_unknown_risk_point(monkeypatch):
+    _patch_geocoder(
+        monkeypatch,
+        [
+            {
+                "address": "Nowhere",
+                "lat": None,
+                "lon": None,
+                "geocoded": False,
+                "error": "No match found",
+            }
+        ],
+    )
+
+    point = flood_data.get_risk_points(["Nowhere"], _StubProvider())[0]
+
+    assert point["geocoded"] is False
+    assert point["risk_score"] == 0.1
+    assert point["risk_label"] == "Unknown"
+    assert point["source"] == "STUB"
+    assert point["lat"] is None and point["lon"] is None
+    assert point["raw"] == {"address": "Nowhere", "error": "No match found"}
+
+
+def test_failed_geocodes_are_kept_in_order_not_dropped(monkeypatch):
+    _patch_geocoder(
+        monkeypatch,
+        [
+            {"address": "A", "lat": 1.0, "lon": 2.0, "geocoded": True},
+            {"address": "B", "lat": None, "lon": None, "geocoded": False},
+            {"address": "C", "lat": 3.0, "lon": 4.0, "geocoded": True},
+        ],
+    )
+
+    points = flood_data.get_risk_points(["A", "B", "C"], _StubProvider())
+
+    assert [p["geocoded"] for p in points] == [True, False, True]
+    assert len(points) == 3
+
+
+def test_ungeocoded_points_are_excluded_by_the_scorer(monkeypatch):
+    """The contract's purpose: a data gap must not move the score."""
+    _patch_geocoder(
+        monkeypatch,
+        [
+            {"address": "A", "lat": 1.0, "lon": 2.0, "geocoded": True},
+            {"address": "B", "lat": None, "lon": None, "geocoded": False},
+        ],
+    )
+
+    points = flood_data.get_risk_points(["A", "B"], _StubProvider())
+    result = scorer.calculate_floodbeta(points)
+
+    assert result["score"] == 1.0  # not (1.0 + 0.1) / 2
+    assert result["facility_count"] == 2
+    assert result["geocoded_count"] == 1
+
+
+def test_flood_data_is_the_only_module_setting_geocoded_false():
+    """Sole ownership of the contract, enforced rather than documented."""
+    package = Path(flood_data.__file__).parent
+    offenders = []
+
+    for path in sorted(package.rglob("*.py")):
+        code = _code_without_docstrings_from_path(path)
+        normalized = code.replace(" ", "").replace("'", '"')
+        if '"geocoded":False' in normalized or "geocoded=False" in normalized:
+            offenders.append(path.name)
+
+    assert offenders == ["flood_data.py"], f"geocoded=False also set in {offenders}"
+
+
 # --- End-to-end pipeline -----------------------------------------------------
 
 
@@ -585,32 +735,17 @@ def test_end_to_end_tsla_pipeline():
     """Ticker -> edgar -> geocoder -> FEMA -> scorer, printed for review."""
     report = edgar.get_facility_report("$TSLA")
     facilities = report["facilities"]
-    geocoded = geocoder.geocode_addresses(report["addresses"])
 
-    if all("Blocked" in g.get("error", "") for g in geocoded):
+    # flood_data owns geocoding, provider routing, and the geocoded contract;
+    # the pipeline is edgar -> flood_data -> scorer.
+    provider = fema.FEMAFloodProvider()
+    risk_points = flood_data.get_risk_points(report["addresses"], provider)
+
+    if all("Blocked" in str(p["raw"].get("error", "")) for p in risk_points):
         pytest.skip(
             "Nominatim returned 403 for every address — this IP is blocked by "
             "its usage policy. Re-run from a normal network for the full pipeline."
         )
-
-    provider = fema.FEMAFloodProvider()
-    risk_points = []
-    for location in geocoded:
-        if location["geocoded"]:
-            point = provider.get_risk_point(location["lat"], location["lon"])
-            point["geocoded"] = True
-        else:
-            # Placeholder so facility_count still reflects the full asset base.
-            point = {
-                "lat": None,
-                "lon": None,
-                "risk_score": None,
-                "risk_label": "Unknown",
-                "source": provider.get_provider_name(),
-                "raw": {"error": location.get("error", "geocoding failed")},
-                "geocoded": False,
-            }
-        risk_points.append(point)
 
     result = scorer.calculate_floodbeta(risk_points)
 
