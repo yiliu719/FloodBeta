@@ -13,6 +13,8 @@ risk_points[i]. Neither list is ever filtered independently — rows are built
 by index first, and only the assembled rows are filtered for display.
 """
 
+import os
+
 import pandas as pd
 import pydeck as pdk
 import streamlit as st
@@ -22,11 +24,51 @@ from floodbeta import edgar, flood_data, scorer
 from floodbeta.providers.fema import FEMAFloodProvider
 
 # SEC and Nominatim both reject requests without a descriptive, contactable
-# user agent. Loading .env here makes SEC_USER_AGENT / NOMINATIM_USER_AGENT
-# available to the pipeline; see .env.example.
-load_dotenv()
+# user agent. See .env.example.
+CREDENTIAL_KEYS = ("SEC_USER_AGENT", "NOMINATIM_USER_AGENT")
 
 st.set_page_config(page_title="FloodBeta", page_icon="🌊", layout="wide")
+
+
+def load_credentials() -> None:
+    """Populate credential env vars from .env locally, st.secrets on Cloud.
+
+    Streamlit Community Cloud has no .env; it exposes st.secrets instead.
+    Local development has no secrets.toml. Both paths are attempted and
+    neither is required, so the same code runs in both places.
+
+    Precedence: **secrets win over environment variables.** Reading
+    st.secrets at all causes Streamlit to export every secret into
+    os.environ, overwriting values already there — so a secrets.toml entry
+    beats an exported shell variable or .env, and the setdefault below is a
+    no-op in that case. It is kept as a fallback in case that export
+    behavior changes. Locally, where no secrets file exists, .env wins
+    because nothing overwrites it.
+
+    Empty values are skipped deliberately. edgar.py and geocoder.py read
+    these with os.environ.get(key, DEFAULT), which returns the empty string
+    rather than DEFAULT once the key exists — writing "" would replace the
+    placeholder user agent with nothing and turn a clear setup message into
+    an opaque 403.
+    """
+    load_dotenv()
+
+    for key in CREDENTIAL_KEYS:
+        try:
+            value = st.secrets.get(key, "")
+        except Exception:
+            # Raises when no secrets.toml exists, which is the normal local
+            # case. The exception type has changed across Streamlit versions
+            # (FileNotFoundError, now StreamlitSecretNotFoundError), so this
+            # deliberately catches broadly rather than pinning a version.
+            value = ""
+
+        if value:
+            os.environ.setdefault(key, str(value))
+
+
+# Must run before any pipeline call reads these variables.
+load_credentials()
 
 # Risk palette, shared by the score banner and the map pins.
 RISK_HEX = {
