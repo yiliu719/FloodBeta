@@ -21,6 +21,9 @@ Given a stock ticker, FloodBeta:
 4. Aggregates results into a single **FloodBeta score** — a 0–1 index of physical flood exposure across the company's asset base
 
 The result is a score, a facility map, and a per-facility breakdown — all traceable back to the original data source.
+<img width="1568" height="714" alt="image" src="https://github.com/user-attachments/assets/3059c330-dd3f-4878-b88e-c8224f0e8b5a" />
+<img width="1568" height="307" alt="image" src="https://github.com/user-attachments/assets/e5eb5894-7383-46a7-a5c3-67c78d5b29f3" />
+
 
 ---
 
