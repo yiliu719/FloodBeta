@@ -6,7 +6,7 @@
 [![Streamlit](https://img.shields.io/badge/built%20with-Streamlit-red.svg)](https://streamlit.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-🔗 **[Live Demo →](https://floodbeta.streamlit.app)** *(coming soon)*
+🔗 **[Live Demo →](https://floodbeta.streamlit.app)**
 
 ---
 
