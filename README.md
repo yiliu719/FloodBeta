@@ -179,9 +179,20 @@ FloodBeta is the first module of a planned **HazardBeta** platform — a physica
 
 ## About
 
-Built by [Yi Liu](https://github.com/yiliu719) — coastal engineer and Columbia Business School MBA candidate (Class of 2028) with a background in flood modeling, storm surge forecasting, and climate risk quantification.
+## About
 
-FloodBeta applies domain expertise from physical hazard science to a financial analysis workflow — quantifying the physical climate risk that moves insurance premiums, stranded asset valuations, and infrastructure investment decisions.
+Built by [Yi Liu](https://www.linkedin.com/in/yi-liu-484321b5/) as a proof-of-concept 
+exploring how physical climate risk data can be surfaced in an 
+investment workflow.
+
+Yi is a coastal engineer and Columbia Business School MBA candidate 
+(Class of 2028) with a background in flood modeling, storm surge 
+forecasting, and climate risk quantification. FloodBeta is a 
+side project applying that domain expertise to a product question: 
+what would a physical risk screener for public equities look like 
+if it were built on open data?
+
+Feedback and contributions welcome.
 
 ---
 
