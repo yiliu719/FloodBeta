@@ -179,8 +179,6 @@ FloodBeta is the first module of a planned **HazardBeta** platform — a physica
 
 ## About
 
-## About
-
 Built by [Yi Liu](https://www.linkedin.com/in/yi-liu-484321b5/) as a proof-of-concept 
 exploring how physical climate risk data can be surfaced in an 
 investment workflow.
