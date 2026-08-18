@@ -1,0 +1,45 @@
+name: Keep FloodBeta Alive
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub runs scheduled workflows on a best-effort
+    # basis and drops runs when the queue is busy, so treat this cadence as
+    # approximate rather than guaranteed.
+    - cron: '*/10 * * * *'
+  # Allows a manual run from the Actions tab to verify the ping without
+  # waiting for the next scheduled trigger.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    name: Ping app
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping FloodBeta
+        env:
+          APP_URL: https://floodbeta.streamlit.app
+        run: |
+          # Deliberate curl flags:
+          #   -s -S  quiet progress, but still print real errors
+          #   no -f  an HTTP error status must not make curl exit non-zero
+          #   no -L  a sleeping app answers with a redirect; following it
+          #          would report the destination's 200 and hide the sleep
+          status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$APP_URL")" \
+            || status="000"
+
+          if [ "$status" = "200" ]; then
+            echo "OK — $APP_URL returned 200"
+          elif [ "$status" = "000" ]; then
+            echo "::warning::No HTTP response from $APP_URL (timeout or network error)."
+          else
+            echo "::warning::$APP_URL returned HTTP $status — a sleeping app answers with a redirect."
+          fi
+
+          # This workflow reports; it never gates anything. A non-200 is
+          # information, not a build failure, so always exit clean.
+          exit 0
