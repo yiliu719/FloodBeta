@@ -124,19 +124,54 @@ Add a **location source selector** to the input form:
 ```
 https://ofmpub.epa.gov/frs_public2/frs_rest_services.get_facilities
 ?facility_name={company_name}
-&state_abbr={optional}
+&state_abbr={REQUIRED}
 &output=JSON
 ```
+
+**`state_abbr` is REQUIRED, not optional.** Omitting it returns an error
+body naming the alternatives: *"The state_abbr, registry_id, pgm_sys_id,
+zip_code, or spatial search parameters were not provided."* A name-only
+search is not possible — every query is scoped to one state.
+
+**Rate limit: 12 requests per minute.** Exceeding it returns HTTP 429 with a
+plain-text body (not JSON). Space requests with `time.sleep(5.2)`. The
+service does publish this limit despite earlier notes here claiming
+otherwise; 0.5s draws a 429 almost immediately.
+
+**Nationwide search costs ~52 requests ≈ 4.5 minutes per ticker**, being one
+request per state plus DC and PR at 5.2s apart. This is too slow to be a
+default, so nationwide is opt-in behind a UI checkbox and a run is blocked
+until the user either picks states or opts in explicitly.
 
 **Company name challenge:** EPA registrations use legal entity names that differ from SEC ticker names. Strategy:
 1. Use the company name returned by SEC EDGAR's ticker lookup as the search term
 2. If no results, try stripping common suffixes ("Inc.", "Corp.", "LLC", "Ltd.")
-3. Return all matched facilities — don't filter by state or facility type
+3. Return all matched facilities — don't filter by facility type
 4. Include the matched EPA name in the `raw` field for transparency
+
+Only retry with the stripped name when every state was actually queried. An
+empty result after skipped states means the query failed, not that the name
+was wrong, and a second full pass would deepen the rate limiting that caused
+it.
+
+**Name matching is noisy for consumer brands.** FRS matches any registered
+facility whose name contains the search term, including third-party
+businesses. "TESLA" in California returns ~155 sites — PG&E substations,
+a mine, and independent repair shops trading on the brand — none of them
+company-owned assets. Consequences:
+- Cap results (`MAX_FACILITIES`) so one ticker cannot generate thousands of
+  downstream flood lookups.
+- Warn in the UI when any single state exceeds 50 matches.
+- Treat EPA-sourced scores as covering a *registered footprint*, which is a
+  different population than EDGAR's disclosed principal properties. The two
+  sources are not directly comparable.
 
 **Pre-geocoded coordinates:** EPA FRS returns lat/lon for most facilities. Always populate `lat`/`lon` in the Facility dict when EPA provides them — do not discard and re-geocode.
 
-**Rate limiting:** EPA FRS has no documented rate limit but add `time.sleep(0.5)` between requests as courtesy.
+Coverage is partial, not total — roughly 134 of 155 TSLA/CA records carry
+coordinates. The rest fall through to the geocoder, so a single run mixes
+facility-level and city-level precision. Report precision **per facility**,
+never as a blanket claim for the source.
 
 ---
 
