@@ -111,6 +111,18 @@ def get_cik_for_ticker(ticker: str) -> str:
     raise EdgarError(f"Ticker '{symbol}' not found in SEC EDGAR's registry.")
 
 
+def get_company_name(ticker: str) -> str:
+    """Return SEC's registered company name for a ticker.
+
+    Used by the EPA provider as its facility-name search term. Reads the
+    submissions endpoint directly rather than get_latest_10k, so it works
+    for filers with no 10-K on record.
+    """
+    cik = get_cik_for_ticker(ticker)
+    data = _get(SUBMISSIONS_URL.format(cik=cik)).json()
+    return data.get("name", "")
+
+
 def get_latest_10k(cik: str) -> dict:
     """Return metadata for the company's most recent annual report.
 

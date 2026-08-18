@@ -21,7 +21,10 @@ from geopy.exc import GeocoderTimedOut
 from floodbeta import flood_data, geocoder, scorer
 from floodbeta.providers.flood import base, fema
 from floodbeta.providers.locations import base as locations_base
-from floodbeta.providers.locations import edgar
+from floodbeta.providers.locations import edgar, epa
+
+# app.py runs Streamlit commands at import; harmless in bare mode.
+import app  # noqa: E402
 
 # Hero demo ticker and validation ticker. Tesla's Gigafactories should surface
 # CA / TX / NV / NY; Lockheed Martin discloses facilities across many states.
@@ -489,6 +492,363 @@ def test_edgar_facilities_match_the_legacy_report():
     legacy = edgar.get_facility_report("$TSLA")["addresses"]
 
     assert migrated == legacy
+
+
+# --- EPA FRS location provider -----------------------------------------------
+
+
+def _epa_response(records, status=200):
+    """Fake an FRS response with the real envelope shape."""
+    return SimpleNamespace(
+        status_code=status,
+        ok=status == 200,
+        json=lambda: {"Results": {"FRSFacility": records}},
+    )
+
+
+def _epa_provider(monkeypatch, handler, states=("TX",)):
+    """EPA provider with a stub session and no rate-limit sleeping."""
+    provider = epa.EpaLocationProvider(
+        states=states, session=SimpleNamespace(get=handler)
+    )
+    monkeypatch.setattr(epa.time, "sleep", lambda s: None)
+    monkeypatch.setattr(epa.edgar, "get_company_name", lambda t: "Tesla, Inc.")
+    return provider
+
+
+EPA_RECORD = {
+    "RegistryId": "110007180059",
+    "FacilityName": "DARLING INGREDIENTS BASTROP",
+    "LocationAddress": "264 FM 2336",
+    "CityName": "BASTROP",
+    "StateAbbr": "TX",
+    "ZipCode": "786023618",
+    "Latitude83": "30.214865",
+    "Longitude83": "-97.30036",
+}
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Tesla, Inc.", "Tesla"),
+        ("Darling Ingredients Inc.", "Darling Ingredients"),
+        ("Lockheed Martin Corp", "Lockheed Martin"),
+        ("某 Holdings LLC", "某 Holdings"),
+        ("Acme", "Acme"),
+    ],
+)
+def test_strip_company_suffix(raw, expected):
+    assert epa.strip_company_suffix(raw) == expected
+
+
+def test_build_address_uses_street_when_present():
+    assert epa.build_address(EPA_RECORD) == "264 Fm 2336, Bastrop, TX 78602"
+
+
+def test_build_address_falls_back_to_city_state():
+    assert epa.build_address({"CityName": "BASTROP", "StateAbbr": "TX"}) == "Bastrop, TX"
+
+
+def test_coordinates_are_parsed_from_strings():
+    assert epa._coordinate("30.21") == 30.21
+    assert epa._coordinate(None) is None
+    assert epa._coordinate("") is None
+
+
+def test_epa_facilities_carry_coordinates_and_schema(monkeypatch):
+    provider = _epa_provider(monkeypatch, lambda *a, **kw: _epa_response([EPA_RECORD]))
+
+    facilities = provider.get_facilities("$DAR")
+
+    assert len(facilities) == 1
+    facility = facilities[0]
+    assert set(facility) == FACILITY_KEYS
+    assert facility["source"] == "EPA FRS"
+    # The whole point of EPA: real coordinates, not city centroids.
+    assert facility["lat"] == 30.214865
+    assert facility["lon"] == -97.30036
+    assert facility["raw"]["MatchedName"] == "Tesla, Inc."
+
+
+def test_epa_has_no_filing_info():
+    """get_filing_info returns None by contract — EPA has no filings."""
+    assert epa.EpaLocationProvider(states=["TX"]).get_filing_info() is None
+
+
+def test_epa_deduplicates_by_registry_id(monkeypatch):
+    provider = _epa_provider(
+        monkeypatch,
+        lambda *a, **kw: _epa_response([EPA_RECORD, dict(EPA_RECORD)]),
+    )
+
+    assert len(provider.get_facilities("$DAR")) == 1
+
+
+def test_epa_retries_then_skips_a_rate_limited_state(monkeypatch):
+    """429 must degrade to a recorded skip, never an exception."""
+    provider = _epa_provider(
+        monkeypatch, lambda *a, **kw: _epa_response([], status=429), states=("TX", "CA")
+    )
+
+    facilities = provider.get_facilities("$DAR")
+
+    assert facilities == []
+    assert provider.skipped_states == ["TX", "CA"]
+
+
+def test_epa_falls_back_to_stripped_name(monkeypatch):
+    """"Tesla, Inc." finds nothing; "Tesla" must be tried next."""
+    seen = []
+
+    def handler(url, params=None, timeout=None):
+        seen.append(params["facility_name"])
+        if params["facility_name"] == "Tesla":
+            return _epa_response([EPA_RECORD])
+        return _epa_response([])
+
+    provider = _epa_provider(monkeypatch, handler)
+    facilities = provider.get_facilities("$TSLA")
+
+    assert seen == ["Tesla, Inc.", "Tesla"]
+    assert len(facilities) == 1
+    assert provider.matched_name == "Tesla"
+
+
+def test_epa_caps_result_volume(monkeypatch):
+    many = [dict(EPA_RECORD, RegistryId=str(i)) for i in range(20)]
+    provider = _epa_provider(monkeypatch, lambda *a, **kw: _epa_response(many))
+    provider.max_facilities = 5
+
+    assert len(provider.get_facilities("$DAR")) == 5
+    assert provider.truncated is True
+
+
+def test_epa_network_failure_is_not_fatal(monkeypatch):
+    def boom(*args, **kwargs):
+        raise requests.ConnectionError("reset")
+
+    provider = _epa_provider(monkeypatch, boom)
+
+    assert provider.get_facilities("$DAR") == []
+    assert provider.skipped_states == ["TX"]
+
+
+# --- Geocoder skipping when a provider supplies coordinates -------------------
+
+
+def test_pregeocoded_facilities_skip_the_geocoder(monkeypatch):
+    """CLAUDE.md: never re-geocode provider-supplied coordinates."""
+    called = []
+    monkeypatch.setattr(
+        flood_data.geocoder,
+        "geocode_addresses",
+        lambda addresses: called.append(addresses) or [],
+    )
+
+    facilities = [
+        {"name": "A", "address": "Bastrop, TX", "lat": 30.2, "lon": -97.3,
+         "source": "EPA FRS", "raw": {}},
+    ]
+    points = flood_data.get_risk_points_for_facilities(facilities, _StubProvider())
+
+    assert called == [[]], "geocoder must not be asked about located facilities"
+    assert points[0]["lat"] == 30.2 and points[0]["lon"] == -97.3
+    assert points[0]["geocoded"] is True
+
+
+def test_mixed_facilities_geocode_only_the_missing_ones(monkeypatch):
+    monkeypatch.setattr(
+        flood_data.geocoder,
+        "geocode_addresses",
+        lambda addresses: [
+            {"address": a, "lat": 1.0, "lon": 2.0, "geocoded": True} for a in addresses
+        ],
+    )
+
+    facilities = [
+        {"name": "pre", "address": "Bastrop, TX", "lat": 30.2, "lon": -97.3,
+         "source": "EPA FRS", "raw": {}},
+        {"name": "none", "address": "Austin, Texas", "lat": None, "lon": None,
+         "source": "SEC EDGAR", "raw": {}},
+    ]
+    points = flood_data.get_risk_points_for_facilities(facilities, _StubProvider())
+
+    assert [(p["lat"], p["lon"]) for p in points] == [(30.2, -97.3), (1.0, 2.0)]
+
+
+def test_failed_geocode_keeps_position_in_facility_order(monkeypatch):
+    monkeypatch.setattr(
+        flood_data.geocoder,
+        "geocode_addresses",
+        lambda addresses: [
+            {"address": a, "lat": None, "lon": None, "geocoded": False,
+             "error": "No match found"}
+            for a in addresses
+        ],
+    )
+
+    facilities = [
+        {"name": "pre", "address": "Bastrop, TX", "lat": 30.2, "lon": -97.3,
+         "source": "EPA FRS", "raw": {}},
+        {"name": "bad", "address": "Nowhere", "lat": None, "lon": None,
+         "source": "SEC EDGAR", "raw": {}},
+        {"name": "pre2", "address": "Austin, TX", "lat": 31.0, "lon": -98.0,
+         "source": "EPA FRS", "raw": {}},
+    ]
+    points = flood_data.get_risk_points_for_facilities(facilities, _StubProvider())
+
+    assert len(points) == 3
+    assert [p["geocoded"] for p in points] == [True, False, True]
+
+
+def test_epa_records_match_counts_per_state(monkeypatch):
+    """Per-state counts drive the noise warning, so they must be tracked."""
+    provider = _epa_provider(
+        monkeypatch,
+        lambda *a, **kw: _epa_response([dict(EPA_RECORD, RegistryId=str(i))
+                                        for i in range(60)]),
+        states=("TX",),
+    )
+
+    provider.get_facilities("$DAR")
+
+    assert provider.state_counts == {"TX": 60}
+
+
+# --- Per-facility precision labelling (app layer) ----------------------------
+
+
+def _facility(source, lat=None, lon=None):
+    return {
+        "name": "F", "address": "Bastrop, TX", "lat": lat, "lon": lon,
+        "source": source, "raw": {},
+    }
+
+
+def test_provider_coordinates_are_labelled_facility_level():
+    label = app.precision_label(_facility("EPA FRS", 30.2, -97.3), geocoded=True)
+
+    assert label == "facility-level (EPA)"
+
+
+def test_geocoded_coordinates_are_labelled_city_level():
+    """EPA supplies no coordinates for some records; those fall to Nominatim."""
+    label = app.precision_label(_facility("EPA FRS"), geocoded=True)
+
+    assert label == "city-level (geocoded)"
+
+
+def test_edgar_facilities_are_always_city_level():
+    label = app.precision_label(_facility("SEC EDGAR"), geocoded=True)
+
+    assert label == "city-level (geocoded)"
+
+
+def test_unlocated_facility_has_no_precision():
+    label = app.precision_label(_facility("EPA FRS"), geocoded=False)
+
+    assert label == "—"
+
+
+def test_mixed_run_labels_each_facility_separately():
+    """The blanket "facility-level" claim was wrong for mixed runs."""
+    facilities = [
+        _facility("EPA FRS", 30.2, -97.3),   # provider coordinates
+        _facility("EPA FRS"),                # fell through to geocoding
+    ]
+    points = [
+        {"lat": 30.2, "lon": -97.3, "risk_score": 0.05, "risk_label": "Low",
+         "source": "FEMA", "raw": {}, "geocoded": True},
+        {"lat": 1.0, "lon": 2.0, "risk_score": 0.3, "risk_label": "Moderate",
+         "source": "FEMA", "raw": {}, "geocoded": True},
+    ]
+
+    rows = app.build_rows(facilities, points)
+
+    assert [row["Precision"] for row in rows] == [
+        "facility-level (EPA)",
+        "city-level (geocoded)",
+    ]
+
+
+# --- Nationwide search is opt-in ---------------------------------------------
+
+
+def test_no_states_and_unchecked_blocks_the_run():
+    """The whole point: a 4-minute scan must never start by accident."""
+    states, error = app.resolve_states(app.SOURCE_EPA, [], search_all=False)
+
+    assert error == "Select at least one state, or check 'Search all states'"
+    assert states is None
+
+
+def test_checkbox_enables_nationwide():
+    states, error = app.resolve_states(app.SOURCE_EPA, [], search_all=True)
+
+    assert error is None
+    assert states is None  # None means every jurisdiction
+
+
+def test_selected_states_are_used_as_given():
+    states, error = app.resolve_states(app.SOURCE_EPA, ["TX", "CA"], search_all=False)
+
+    assert error is None
+    assert states == ["TX", "CA"]
+
+
+def test_checkbox_overrides_the_state_selector():
+    states, error = app.resolve_states(app.SOURCE_EPA, ["TX"], search_all=True)
+
+    assert error is None
+    assert states is None
+
+
+def test_edgar_is_never_blocked_by_state_validation():
+    """EDGAR reads a filing — it has no state dimension to validate."""
+    states, error = app.resolve_states(app.SOURCE_EDGAR, [], search_all=False)
+
+    assert error is None
+    assert states is None
+
+
+# --- EPA FRS live (network) ---------------------------------------------------
+
+# Scoped to one state each: FRS allows 12 requests/minute and requires a
+# state per request, so a nationwide test run would take minutes.
+EPA_LIVE_CASES = [("$TSLA", "CA"), ("$DAR", "TX")]
+
+
+@pytest.mark.parametrize("ticker,state", EPA_LIVE_CASES)
+def test_epa_live_lookup(ticker, state):
+    """Print EPA facility counts and one sample facility per ticker."""
+    provider = epa.EpaLocationProvider(states=[state])
+    facilities = provider.get_facilities(ticker)
+
+    print(f"\n{'=' * 74}")
+    print(f"EPA FRS — {ticker} in {state}")
+    print(f"  matched name : {provider.matched_name}")
+    print(f"  facilities   : {len(facilities)}")
+    print(f"  skipped      : {provider.skipped_states}")
+    print(f"  truncated    : {provider.truncated}")
+    if facilities:
+        sample = facilities[0]
+        print(f"{'-' * 74}\n  sample facility:")
+        for key in ("name", "address", "lat", "lon", "source"):
+            print(f"    {key:8}: {sample[key]}")
+        print(f"    raw keys: {sorted(sample['raw'])}")
+        located = sum(f["lat"] is not None for f in facilities)
+        print(f"{'-' * 74}\n  {located}/{len(facilities)} carry coordinates")
+    print(f"{'=' * 74}")
+
+    if provider.skipped_states:
+        pytest.skip(f"EPA FRS rate-limited state {state}; re-run in a minute.")
+
+    assert isinstance(facilities, list)
+    for facility in facilities:
+        assert set(facility) == FACILITY_KEYS
+        assert facility["source"] == "EPA FRS"
+        assert isinstance(facility["address"], str) and facility["address"]
 
 
 def test_empty_facility_name_becomes_none():

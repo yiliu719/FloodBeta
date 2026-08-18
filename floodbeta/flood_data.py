@@ -27,6 +27,21 @@ UNGEOCODED_RISK_SCORE = 0.1
 UNGEOCODED_RISK_LABEL = "Unknown"
 
 
+def _ungeocoded_point(address: str, error: str, provider_name: str) -> RiskPoint:
+    """A facility that never got a coordinate. Excluded from the score."""
+    return {
+        "lat": None,
+        "lon": None,
+        "risk_score": UNGEOCODED_RISK_SCORE,
+        "risk_label": UNGEOCODED_RISK_LABEL,
+        "source": provider_name,
+        # No flood provider was ever queried, so `raw` carries the geocoding
+        # failure instead — the reason this point exists.
+        "raw": {"address": address, "error": error},
+        "geocoded": False,
+    }
+
+
 def get_risk_points(
     addresses: list[str], provider: FloodDataProvider
 ) -> list[RiskPoint]:
@@ -50,20 +65,65 @@ def get_risk_points(
             point = provider.get_risk_point(entry["lat"], entry["lon"])
             point["geocoded"] = True
         else:
-            point = {
-                "lat": None,
-                "lon": None,
-                "risk_score": UNGEOCODED_RISK_SCORE,
-                "risk_label": UNGEOCODED_RISK_LABEL,
-                "source": provider.get_provider_name(),
-                # No provider was ever queried, so `raw` carries the
-                # geocoding failure instead — the reason this point exists.
-                "raw": {
-                    "address": entry["address"],
-                    "error": entry.get("error", "Geocoding failed"),
-                },
-                "geocoded": False,
-            }
+            point = _ungeocoded_point(
+                entry["address"],
+                entry.get("error", "Geocoding failed"),
+                provider.get_provider_name(),
+            )
+        risk_points.append(point)
+
+    return risk_points
+
+
+def get_risk_points_for_facilities(
+    facilities: list, provider: FloodDataProvider
+) -> list[RiskPoint]:
+    """Facility list -> RiskPoints, geocoding only what needs it.
+
+    A facility that already carries lat/lon goes straight to the flood
+    lookup. Provider-supplied coordinates are real facility positions;
+    re-geocoding would replace them with a city centroid and lose the
+    precision EPA FRS gives us for free.
+
+    Facilities without coordinates are batched through the geocoder in one
+    call, so its 1 req/sec pacing still applies across them collectively.
+    Returns one RiskPoint per input facility, in input order.
+    """
+    needs_geocoding = [
+        index
+        for index, facility in enumerate(facilities)
+        if facility.get("lat") is None or facility.get("lon") is None
+    ]
+
+    located = dict(
+        zip(
+            needs_geocoding,
+            geocoder.geocode_addresses(
+                [facilities[index]["address"] for index in needs_geocoding]
+            ),
+        )
+    )
+
+    risk_points: list[RiskPoint] = []
+    for index, facility in enumerate(facilities):
+        entry = located.get(index)
+
+        if entry is None:
+            lat, lon = facility["lat"], facility["lon"]
+        elif entry["geocoded"]:
+            lat, lon = entry["lat"], entry["lon"]
+        else:
+            risk_points.append(
+                _ungeocoded_point(
+                    facility["address"],
+                    entry.get("error", "Geocoding failed"),
+                    provider.get_provider_name(),
+                )
+            )
+            continue
+
+        point = provider.get_risk_point(lat, lon)
+        point["geocoded"] = True
         risk_points.append(point)
 
     return risk_points

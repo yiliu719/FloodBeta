@@ -22,7 +22,11 @@ from dotenv import load_dotenv
 
 from floodbeta import flood_data, scorer
 from floodbeta.providers.flood.fema import FEMAFloodProvider
-from floodbeta.providers.locations import edgar
+from floodbeta.providers.locations import edgar, epa
+
+SOURCE_EDGAR = "SEC EDGAR"
+SOURCE_EPA = "EPA FRS"
+SOURCES = [SOURCE_EDGAR, SOURCE_EPA]
 
 # SEC and Nominatim both reject requests without a descriptive, contactable
 # user agent. See .env.example.
@@ -88,6 +92,27 @@ INSUFFICIENT_HEX = "#8a8f98"
 
 NOT_FOUND_NOTE = "Location not found"
 
+# Per-facility coordinate provenance. A run can mix both: EPA supplies
+# coordinates for most facilities but not all, and the rest fall through to
+# Nominatim city centroids. A blanket claim either way would be wrong.
+PRECISION_GEOCODED = "city-level (geocoded)"
+PRECISION_NONE = "—"
+
+# EPA name matching returns every business registered under a similar name,
+# so a large single-state count is a signal to check the list, not a win.
+NOISE_THRESHOLD = 50
+
+
+def precision_label(facility: dict, geocoded: bool) -> str:
+    """Where this facility's coordinate actually came from."""
+    if not geocoded:
+        return PRECISION_NONE
+    if facility.get("lat") is None or facility.get("lon") is None:
+        return PRECISION_GEOCODED
+    source = facility.get("source") or "provider"
+    # "EPA FRS" reads better as "EPA" in a per-row label.
+    return f"facility-level ({'EPA' if source.startswith('EPA') else source})"
+
 
 def fema_zone(risk_point: dict) -> str:
     """Read the FEMA zone out of a RiskPoint's preserved raw payload.
@@ -123,6 +148,7 @@ def build_rows(facilities: list, risk_points: list) -> list:
                 # renders it blank instead of the literal text "None".
                 "Risk Score": point["risk_score"] if geocoded else float("nan"),
                 "Risk Label": point["risk_label"],
+                "Precision": precision_label(facility, geocoded),
                 "Note": "" if geocoded else NOT_FOUND_NOTE,
                 "_lat": point["lat"],
                 "_lon": point["lon"],
@@ -132,23 +158,66 @@ def build_rows(facilities: list, risk_points: list) -> list:
     return rows
 
 
-def run_pipeline(ticker: str) -> dict:
-    """edgar -> flood_data -> scorer. Returns a dict with `error` on failure."""
-    try:
-        report = edgar.get_facility_report(ticker)
-    except edgar.EdgarError as exc:
-        return {"ticker": ticker, "error": str(exc)}
+STATE_VALIDATION_MESSAGE = (
+    "Select at least one state, or check 'Search all states'"
+)
 
-    provider = FEMAFloodProvider()
-    risk_points = flood_data.get_risk_points(report["addresses"], provider)
-    result = scorer.calculate_floodbeta(risk_points)
+
+def resolve_states(source: str, selected, search_all: bool):
+    """Decide the EPA state scope. Returns (states, validation_error).
+
+    `states` of None means nationwide; the provider expands that to every
+    jurisdiction. A validation error means the pipeline must not run.
+
+    Nationwide is opt-in: with no states chosen and the box unchecked, the
+    run is blocked rather than silently starting a four-minute scan. The
+    checkbox overrides the selector when both are set.
+
+    Only EPA consumes states — SEC EDGAR reads a filing and has no state
+    dimension, so it is never blocked by this.
+    """
+    if source != SOURCE_EPA:
+        return None, None
+    if search_all:
+        return None, None
+    if selected:
+        return list(selected), None
+    return None, STATE_VALIDATION_MESSAGE
+
+
+def make_location_provider(source: str, states: list | None = None):
+    """Build the location provider for the selected source."""
+    if source == SOURCE_EPA:
+        return epa.EpaLocationProvider(states=states)
+    return edgar.EdgarLocationProvider()
+
+
+def run_pipeline(ticker: str, source: str, states: list | None = None) -> dict:
+    """location provider -> flood_data -> scorer.
+
+    Returns a dict carrying `error` on failure rather than raising, so the
+    UI can show a clean message instead of a stack trace.
+    """
+    location_provider = make_location_provider(source, states)
+
+    try:
+        facilities = location_provider.get_facilities(ticker)
+    except (edgar.EdgarError, epa.EpaError) as exc:
+        return {"ticker": ticker, "source": source, "error": str(exc)}
+
+    flood_provider = FEMAFloodProvider()
+    risk_points = flood_data.get_risk_points_for_facilities(
+        facilities, flood_provider
+    )
 
     return {
         "ticker": ticker,
+        "source": source,
         "error": None,
-        "report": report,
-        "rows": build_rows(report["facilities"], risk_points),
-        "result": result,
+        "provider": location_provider,
+        "filing_info": location_provider.get_filing_info(),
+        "rows": build_rows(facilities, risk_points),
+        "result": scorer.calculate_floodbeta(risk_points),
     }
 
 
@@ -253,33 +322,156 @@ def render_table(rows: list) -> None:
     )
 
 
-def render_provenance(report: dict) -> None:
-    st.markdown(
-        f"**{report['company']}** — {report['form']} filed {report['filing_date']}"
+def render_provenance(pipeline: dict) -> None:
+    """Provenance adapts to the source: a filing for EDGAR, a registry for EPA.
+
+    get_filing_info() returns None for EPA by contract, which is the signal
+    that there is no filing to cite.
+    """
+    info = pipeline.get("filing_info")
+
+    if info:
+        st.markdown(f"**{info['company']}** — {info['form']} filed {info['filing_date']}")
+        st.link_button("View filing on SEC EDGAR", info["url"])
+        return
+
+    provider = pipeline.get("provider")
+    matched = getattr(provider, "matched_name", None)
+    st.markdown("**EPA Facility Registry Service**")
+    if matched:
+        st.caption(f"Matched on registered name: “{matched}”")
+    searched = getattr(provider, "searched_states", ())
+    if searched:
+        scope = "all states" if len(searched) > 10 else ", ".join(searched)
+        st.caption(f"Searched: {scope}")
+    st.link_button("About EPA FRS", epa.REGISTRY_URL)
+
+
+def render_precision_note(rows: list) -> None:
+    """State the actual precision mix rather than a blanket claim.
+
+    A run can be entirely provider coordinates, entirely geocoded centroids,
+    or any mix of the two, so the counts are computed from the rows rather
+    than inferred from which source was selected.
+    """
+    provider_count = sum(
+        1 for row in rows if row["Precision"].startswith("facility-level")
     )
-    st.link_button("View filing on SEC EDGAR", report["url"])
+    geocoded_count = sum(
+        1 for row in rows if row["Precision"] == PRECISION_GEOCODED
+    )
+
+    parts = []
+    if provider_count:
+        parts.append(f"{provider_count} facility-level (provider coordinates)")
+    if geocoded_count:
+        parts.append(f"{geocoded_count} city-level (geocoded to a city centroid)")
+
+    if not parts:
+        st.caption("**Precision:** no facility could be located.")
+        return
+
+    st.caption(
+        f"**Precision:** {', '.join(parts)}. "
+        "City-level points reflect a city centroid, not a building location — "
+        "see the Precision column for which is which."
+    )
+
+
+def render_source_notices(pipeline: dict) -> None:
+    """Surface EPA-specific caveats that would otherwise be invisible."""
+    provider = pipeline.get("provider")
+    if pipeline.get("source") != SOURCE_EPA or provider is None:
+        return
+
+    noisy = {
+        state: count
+        for state, count in (getattr(provider, "state_counts", None) or {}).items()
+        if count > NOISE_THRESHOLD
+    }
+    if noisy:
+        st.warning(
+            "Large number of results — EPA name matching may include "
+            "third-party businesses registered under similar names. Review "
+            "the facility list carefully."
+        )
+
+    if getattr(provider, "truncated", False):
+        st.warning(
+            f"Results capped at {provider.max_facilities} facilities. The score "
+            "reflects that subset, not the full registered footprint."
+        )
+    skipped = getattr(provider, "skipped_states", [])
+    if skipped:
+        st.warning(
+            f"{len(skipped)} state(s) could not be queried "
+            f"({', '.join(skipped[:8])}{'…' if len(skipped) > 8 else ''}) — "
+            "EPA FRS rate limiting. Facilities there are missing from the score."
+        )
 
 
 st.title("🌊 FloodBeta")
 st.caption(
-    "Physical flood risk exposure for public equities, from SEC-reported "
+    "Physical flood risk exposure for public equities, from disclosed "
     "facility locations."
 )
 
 with st.form("ticker_form"):
-    raw_ticker = st.text_input(
-        "Ticker", placeholder="TSLA", help="Leading '$' is fine — it is stripped."
+    left, right = st.columns([2, 1])
+    with left:
+        raw_ticker = st.text_input(
+            "Ticker", placeholder="TSLA", help="Leading '$' is fine — it is stripped."
+        )
+    with right:
+        source = st.selectbox(
+            "Location source",
+            SOURCES,
+            index=SOURCES.index(SOURCE_EDGAR),
+            help="SEC EDGAR reads 10-K Item 2 (city-level). EPA FRS returns "
+            "registered facilities with real coordinates.",
+        )
+
+    epa_states = st.multiselect(
+        "EPA states",
+        epa.US_STATES,
+        default=[],
+        placeholder="Select states to search",
+        help="EPA FRS requires a state per request and allows only 12 requests "
+        "per minute, so each state adds about five seconds. Ignored for "
+        "SEC EDGAR.",
+    )
+    search_all_states = st.checkbox(
+        "Search all states (slow — ~4 min)",
+        value=False,
+        help="Queries all 52 jurisdictions. Overrides the state selector.",
     )
     submitted = st.form_submit_button("Screen")
 
 if submitted and raw_ticker.strip():
     ticker = edgar.normalize_ticker(raw_ticker)
-    cached = st.session_state.get("pipeline")
+    states, validation_error = resolve_states(source, epa_states, search_all_states)
 
-    # Only re-run when the ticker actually changed.
-    if not cached or cached["ticker"] != ticker:
-        with st.spinner(f"Screening {ticker} — reading 10-K, geocoding, querying FEMA…"):
-            st.session_state["pipeline"] = run_pipeline(ticker)
+    if validation_error:
+        st.warning(validation_error)
+    else:
+        # Cache key is ticker + source + state scope: changing any of them
+        # must re-run rather than showing the previous selection's results.
+        cache_key = (
+            ticker,
+            source,
+            tuple(states) if states else (),
+            bool(search_all_states),
+        )
+        cached = st.session_state.get("pipeline")
+
+        if not cached or cached.get("cache_key") != cache_key:
+            spinner = f"Screening {ticker} via {source}…"
+            if source == SOURCE_EPA and states is None:
+                spinner += " searching all states — this takes several minutes"
+            with st.spinner(spinner):
+                result = run_pipeline(ticker, source, states)
+            result["cache_key"] = cache_key
+            st.session_state["pipeline"] = result
 elif submitted:
     st.warning("Enter a ticker to screen.")
 
@@ -289,13 +481,23 @@ if pipeline:
     if pipeline["error"]:
         st.error(pipeline["error"])
     elif not pipeline["rows"]:
-        st.warning(
-            f"No facility locations could be extracted from {pipeline['ticker']}'s "
-            "latest 10-K. Property disclosures vary widely between filers."
-        )
-        render_provenance(pipeline["report"])
+        if pipeline["source"] == SOURCE_EPA:
+            st.warning(
+                f"No EPA-registered facilities matched {pipeline['ticker']}. EPA "
+                "records use legal entity names that may differ from the SEC "
+                "name; try narrowing to a state where the company operates."
+            )
+        else:
+            st.warning(
+                f"No facility locations could be extracted from "
+                f"{pipeline['ticker']}'s latest 10-K. Property disclosures vary "
+                "widely between filers."
+            )
+        render_provenance(pipeline)
+        render_source_notices(pipeline)
     else:
         render_score(pipeline["result"])
+        render_source_notices(pipeline)
         st.divider()
 
         left, right = st.columns([3, 2])
@@ -303,18 +505,15 @@ if pipeline:
             st.subheader("Facility map")
             render_map(pipeline["rows"])
         with right:
-            st.subheader("Filing")
-            render_provenance(pipeline["report"])
+            st.subheader("Source")
+            render_provenance(pipeline)
 
         st.subheader("Per-facility breakdown")
         render_table(pipeline["rows"])
 
     st.divider()
     # Transparency disclosures required by CLAUDE.md.
-    st.caption(
-        "**Precision:** city-level only — scores reflect city centroids, "
-        "not building locations."
-    )
+    render_precision_note(pipeline.get("rows") or [])
     st.caption(
         "**Data source:** FEMA NFHL via hazards.fema.gov. Updated annually."
     )
