@@ -1,13 +1,13 @@
 # FloodBeta — CLAUDE.md
 
 ## Project Overview
-FloodBeta is a physical climate risk screener for public equities. It takes a stock ticker, extracts the company's major facility locations from SEC 10-K filings, geocodes them, and overlays flood zone data to produce a physical climate exposure score — the "flood beta" of a company's asset base.
+FloodBeta is a physical climate risk screener for public equities. It takes a stock ticker, locates the company's facility footprint from one or more data sources, geocodes each location, overlays FEMA flood zone data, and produces a physical climate exposure score — the "flood beta" of a company's asset base.
 
 **Target users:** Climate-focused investors, portfolio analysts, and risk researchers who want to quickly assess a public company's physical flood exposure without manual research.
 
 **Deployment target:** Streamlit Community Cloud (keep dependencies minimal and compatible)
 
-**Strategic context:** FloodBeta is the first module of a broader physical risk intelligence platform called HazardBeta. Architecture decisions should support future expansion to other hazard types (wildfire, earthquake, tsunami) and other asset classes (private infrastructure, real assets) — but FloodBeta itself stays focused on flood risk for public equities only.
+**Strategic context:** FloodBeta is the first module of a broader physical risk intelligence platform called HazardBeta. Architecture decisions should support future expansion to other hazard types (wildfire, earthquake, tsunami) — but FloodBeta itself stays focused on flood risk for public equities only.
 
 ---
 
@@ -16,233 +16,199 @@ FloodBeta is a physical climate risk screener for public equities. It takes a st
 - **Frontend:** Streamlit
 - **Data sources:**
   - SEC EDGAR full-text search API (free, no key required) for 10-K filings
-  - FEMA National Flood Hazard Layer (NFHL) REST API (free, no key required) — primary flood data provider
-    - Endpoint: `https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer/28/query` (layer 28 = "Flood Hazard Zones")
-    - **Not** `msc.fema.gov` — that host serves the human-facing Map Service Center website and returns `Service not found` for this path
-  - `geopy` with Nominatim geocoder for address → lat/lon
-- **Key libraries:** `streamlit`, `requests`, `geopy`, `pandas`, `pydeck` (for map viz), `python-dotenv`
+  - EPA Facility Registry Service (FRS) API (free, no key required) for facility locations
+  - FEMA Flood Map Service Center API (free, no key required) — primary flood data provider
+  - `geopy` with Nominatim geocoder for address → lat/lon (skipped when provider supplies coordinates)
+- **Key libraries:** `streamlit`, `requests`, `geopy`, `pandas`, `pydeck`, `python-dotenv`
 
 ---
 
 ## Project Structure
 ```
 FloodBeta/
-├── CLAUDE.md               # This file
-├── README.md               # Product-facing readme (written like a product brief)
-├── LICENSE                 # MIT
-├── requirements.txt        # All dependencies pinned
-├── .gitignore              # Python gitignore (already set up)
-├── .env.example            # Template for any future API keys
-├── app.py                  # Main Streamlit entry point
+├── CLAUDE.md
+├── README.md
+├── LICENSE
+├── requirements.txt
+├── .gitignore
+├── .env.example
+├── app.py                          # Main Streamlit entry point
 ├── floodbeta/
 │   ├── __init__.py
-│   ├── edgar.py            # SEC EDGAR: ticker → 10-K → facility locations
-│   ├── geocoder.py         # Address → lat/lon using geopy
-│   ├── flood_data.py       # Flood zone lookup — routes to configured provider
+│   ├── geocoder.py                 # Address → lat/lon (Nominatim fallback)
+│   ├── flood_data.py               # Orchestrates location provider + flood provider
+│   ├── scorer.py                   # Provider-agnostic FloodBeta aggregation
 │   ├── providers/
 │   │   ├── __init__.py
-│   │   ├── base.py         # Abstract base class: FloodDataProvider + normalized output schema
-│   │   └── fema.py         # FEMA implementation of FloodDataProvider
-│   └── scorer.py           # Aggregates normalized risk scores into FloodBeta score
+│   │   ├── locations/              # Asset location providers
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py             # Abstract AssetLocationProvider + Facility schema
+│   │   │   ├── edgar.py            # SEC EDGAR 10-K Item 2 extraction (moved here)
+│   │   │   └── epa.py              # EPA Facility Registry Service (new)
+│   │   └── flood/                  # Flood data providers
+│   │       ├── __init__.py
+│   │       ├── base.py             # Abstract FloodDataProvider + RiskPoint schema
+│   │       └── fema.py             # FEMA NFHL implementation
 └── tests/
-    └── test_basic.py       # Basic smoke tests
+    └── test_basic.py
 ```
 
 ---
 
-## Data Provider Architecture (Critical)
-The scoring methodology is split into two layers. **Never conflate them.**
+## Provider Schemas
 
-### Layer 1 — Provider normalization (provider-specific, lives in providers/)
-Each provider converts its raw output format into a **normalized RiskPoint schema**.
-This is where provider-specific logic lives — zone names, depth values, raster lookups, etc.
+### AssetLocationProvider (providers/locations/base.py)
+Every location provider must return a list of `Facility` dicts:
 
 ```python
-# providers/base.py — normalized output schema every provider must return
-# This is the ONLY format scorer.py ever sees
+Facility = {
+    "name": str | None,      # Facility name if known (e.g. "Gigafactory Texas")
+    "address": str,          # Human-readable address (city, state minimum)
+    "lat": float | None,     # Pre-geocoded latitude if provider supplies it
+    "lon": float | None,     # Pre-geocoded longitude if provider supplies it
+    "source": str,           # Provider name e.g. "SEC EDGAR", "EPA FRS"
+    "raw": dict              # Raw provider output for transparency/debugging
+}
 
-from typing import TypedDict
-
-# Risk labels a provider may emit. Kept here, not in scorer.py, so every
-# provider agrees on the vocabulary.
-RISK_LABELS = ("Low", "Moderate", "High", "Unknown")
-
-
-class RiskPoint(TypedDict):
-    """Normalized per-facility risk record."""
-
-    lat: float          # Facility latitude
-    lon: float          # Facility longitude
-    risk_score: float   # 0.0 (no risk) -> 1.0 (highest risk), provider normalized
-    risk_label: str     # Human-readable: "Low" / "Moderate" / "High" / "Unknown"
-    source: str         # Provider name e.g. "FEMA", "First Street"
-    raw: dict           # Raw provider output, preserved for debugging/transparency
-
-
-# Abstract base class — all providers must implement this
-class FloodDataProvider:
-    """Interface every flood data provider must implement."""
-
-    def get_risk_point(self, lat: float, lon: float) -> RiskPoint:
+class AssetLocationProvider:
+    def get_facilities(self, ticker: str) -> list[Facility]:
         raise NotImplementedError
-
     def get_provider_name(self) -> str:
         raise NotImplementedError
+    def get_filing_info(self) -> dict | None:
+        # Optional: return filing provenance (company name, date, URL)
+        # Return None if not applicable (e.g. EPA doesn't have filings)
+        raise NotImplementedError
 ```
 
-`RiskPoint` is a `TypedDict`, so it is a plain `dict` at runtime — providers
-build and return dict literals as before, and the annotation only documents
-and type-checks the shape. `risk_label` must be one of `RISK_LABELS`.
+**Key design note:** If a provider supplies `lat`/`lon`, the geocoder step is skipped for that facility — go straight to the flood zone lookup. This avoids degrading EPA's pre-geocoded coordinates to city centroids.
 
-### Layer 2 — FloodBeta scoring (provider-agnostic, lives in scorer.py)
-scorer.py receives a list of RiskPoints and aggregates them into a single FloodBeta score.
-It never sees zone names, depth values, or any provider-specific data — only normalized risk_scores.
+### FloodDataProvider (providers/flood/base.py) — unchanged
+See existing implementation. RiskPoint schema and FloodDataProvider interface remain as built.
 
-```python
-# FloodBeta = mean(risk_scores) across all facilities
-# Weighted equally per facility (future: weight by facility size/revenue if data available)
+---
 
-FloodBeta score ranges:
-  0.0 – 0.2  →  Low exposure
-  0.2 – 0.5  →  Moderate exposure
-  0.5 – 1.0  →  High exposure
+## Core Workflow (Updated)
+```
+Ticker input + user-selected location source
+    → location provider (edgar.py OR epa.py) → list of Facility dicts
+    → flood_data.py:
+        for each facility:
+            if facility has lat/lon → skip geocoder
+            else → geocoder.py → lat/lon
+        → flood provider → RiskPoint per facility
+    → scorer.py → FloodBeta score
+    → app.py → display score, map, breakdown, provenance
 ```
 
 ---
 
-## Provider-Specific Normalization Rules
+## UI Changes (app.py)
+Add a **location source selector** to the input form:
+```
+[ Ticker input    ] [ Source: SEC EDGAR ▼ ] [ Screen ]
+                           EPA FRS
+                           SEC EDGAR
+```
 
-### FEMA National Flood Hazard Layer (current)
-FEMA outputs categorical flood zone labels in `FLD_ZONE`, with a `ZONE_SUBTY`
-qualifier. Normalize to risk_score as follows:
-
-| FEMA Zone | Description | risk_score |
-|-----------|-------------|------------|
-| AE, A, AO, AH, A1-30 | 100-year floodplain (SFHA) | 1.0 |
-| AE (floodway) | Highest velocity flood path — arrives as `FLD_ZONE=AE` + `ZONE_SUBTY=FLOODWAY` | 1.0 |
-| V, VE, V1-30 | Coastal high hazard — SFHA *with* wave action | 1.0 |
-| AR, A99 | SFHA pending or behind planned protection | 1.0 |
-| X (shaded) / B | 500-year / moderate risk | 0.3 |
-| X (levee-protected) | Dry only because a levee holds — residual risk is real | 0.3 |
-| X (unshaded) / C | Minimal risk | 0.05 |
-| D / "AREA NOT INCLUDED" / unrecognized / no data | Undetermined | 0.1 |
-
-**Zone X requires reading `ZONE_SUBTY`** — the zone code alone cannot separate
-the three X cases. Treat X as 0.3 when the subtype contains `0.2 PCT` (the
-500-year floodplain) or `LEVEE` (e.g. `AREA WITH REDUCED FLOOD RISK DUE TO
-LEVEE`); otherwise 0.05.
-
-Zone matching is case- and whitespace-insensitive. Numbered legacy zones
-(A1-A30, V1-V30) come from older FIRMs and are equivalent to their unnumbered
-forms.
-
-**Overlapping polygons resolve to the highest risk present.** A point on a
-zone boundary can intersect several polygons; the query returns all of them
-and the provider takes the maximum risk_score rather than whichever the
-service happened to list first. Flood screening should err conservative.
-
-**ArcGIS reports failures with HTTP 200 and an `error` key in the body**, so
-the status code alone is not a success signal. Any failure — network error,
-error body, malformed JSON, or a point outside NFHL coverage — yields
-risk_score 0.1 / "Unknown", never an exception. Note that no coverage means
-*no data*, which is not the same as low risk.
-
-### Future providers — inundation depth / water surface elevation rasters
-Providers like First Street Foundation, NOAA inundation models, and USGS flood products
-output continuous variables (depth in feet or water surface elevation), not zone labels.
-Normalize using a depth-damage curve consistent with FEMA HAZUS methodology:
-
-| Inundation Depth | risk_score | Rationale |
-|-----------------|------------|-----------|
-| 0 ft | 0.0 | No flooding |
-| 0–1 ft | 0.2 | Nuisance flooding, minimal structural damage |
-| 1–3 ft | 0.5 | Significant ground-floor asset damage |
-| 3–6 ft | 0.8 | Major structural damage |
-| 6+ ft | 1.0 | Catastrophic |
-
-This curve is defensible because it aligns with FEMA's own depth-damage functions.
-Document the source in any UI that displays scores from depth-based providers.
+- Default to SEC EDGAR (existing behavior)
+- When EPA FRS is selected, use `epa.py` as the location provider
+- Filing provenance section should adapt: show filing info for SEC EDGAR, show "EPA Facility Registry" with a link for EPA FRS
+- Session state cache key must include both ticker AND selected source — changing source should re-run the pipeline
 
 ---
 
-## Core Workflow (Pipeline)
+## EPA FRS Implementation Notes (providers/locations/epa.py)
+
+**API endpoint:**
 ```
-Ticker input
-    → edgar.py: fetch latest 10-K, extract facility/property addresses
-    → geocoder.py: convert addresses to lat/lon coordinates
-    → flood_data.py: route to configured provider → returns list of RiskPoints
-    → scorer.py: aggregate RiskPoints into FloodBeta score (0.0–1.0)
-    → app.py: display score, map, and per-facility breakdown in Streamlit UI
+https://ofmpub.epa.gov/frs_public2/frs_rest_services.get_facilities
+?facility_name={company_name}
+&state_abbr={optional}
+&output=JSON
 ```
+
+**Company name challenge:** EPA registrations use legal entity names that differ from SEC ticker names. Strategy:
+1. Use the company name returned by SEC EDGAR's ticker lookup as the search term
+2. If no results, try stripping common suffixes ("Inc.", "Corp.", "LLC", "Ltd.")
+3. Return all matched facilities — don't filter by state or facility type
+4. Include the matched EPA name in the `raw` field for transparency
+
+**Pre-geocoded coordinates:** EPA FRS returns lat/lon for most facilities. Always populate `lat`/`lon` in the Facility dict when EPA provides them — do not discard and re-geocode.
+
+**Rate limiting:** EPA FRS has no documented rate limit but add `time.sleep(0.5)` between requests as courtesy.
+
+---
+
+## Migration: edgar.py → providers/locations/edgar.py
+The existing `floodbeta/edgar.py` must be moved to `floodbeta/providers/locations/edgar.py` and refactored to implement `AssetLocationProvider`:
+
+- `get_facilities(ticker)` replaces `get_facility_report(ticker)` as the primary interface
+- `get_filing_info()` returns the filing provenance dict (company name, form, date, URL) that `get_facility_report()` currently returns
+- Internal logic (EDGAR API calls, Item 2 parsing, address extraction) stays unchanged
+- `Facility` dicts should populate `lat=None`, `lon=None` since EDGAR provides city/state only
+- All existing tests must continue to pass after the move
+
+**Import compatibility:** Add a shim in `floodbeta/__init__.py` or update imports in `flood_data.py` and `tests/` — do not leave broken imports anywhere.
+
+---
+
+## FloodBeta Score Methodology — unchanged
+See existing CLAUDE.md. Scoring logic in scorer.py is not affected by this refactor.
+
+## Zone Scoring Table — unchanged
+See existing CLAUDE.md. FEMA provider logic is not affected by this refactor.
 
 ---
 
 ## Commands
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Run the app locally
 streamlit run app.py
-
-# Run tests
 python -m pytest tests/
 ```
 
 ---
 
 ## Development Principles
-- **Working demo over perfect architecture** — prioritize getting something runnable end-to-end before optimizing
-- **Hard separation between provider normalization and scoring** — scorer.py must never contain provider-specific logic; providers must never contain scoring aggregation logic
-- **Fail gracefully** — if SEC EDGAR returns no locations, or a provider returns no data, show a clear message rather than crashing
-- **Transparency over black box** — always show the user what facilities were found, which provider was used, and how the score was calculated
-- **Keep it simple** — no database, no auth, no backend server; pure Streamlit + API calls
-- **Rate limit awareness** — EDGAR and Nominatim both have rate limits; add `time.sleep()` between batch requests
-- **Preserve raw provider output** — always include `raw` field in RiskPoint so users and developers can audit the underlying data
+- **Pre-geocoded coordinates take priority** — never discard provider-supplied lat/lon in favor of re-geocoding
+- **Working demo over perfect architecture** — get EPA working end-to-end before polishing
+- **Fail gracefully** — if EPA returns no matches, show a clear message; don't crash
+- **Transparency** — UI must show which source produced the facilities
+- **Session state cache includes source** — ticker + source together are the cache key
+- **All existing tests must pass** — the edgar.py migration must not break the test suite
 
 ---
 
 ## Things to Avoid
-- Don't use paid APIs — all data sources must be free and publicly accessible
-- Don't store user queries or results — this is a stateless demo tool
-- Don't over-engineer the scoring model — it should be explainable in one paragraph
-- Don't use a database — keep state in Streamlit session state only
-- Don't add authentication — this is a public portfolio demo
-- Don't expand scope to non-flood hazards in this repo — that belongs in future HazardBeta modules
-- Don't expand asset coverage beyond SEC-reported facilities — commodity/agricultural asset coverage is out of scope for FloodBeta
-- Don't put FEMA zone logic in scorer.py — it belongs in providers/fema.py
-- Don't put scoring aggregation logic in any provider — it belongs in scorer.py
+- Don't use paid APIs
+- Don't store user queries or results
+- Don't use a database
+- Don't add authentication
+- Don't expand scope to non-flood hazards in this repo
+- Don't re-geocode when a provider already supplies lat/lon
+- Don't break existing edgar.py functionality during the migration
+- Don't put FEMA zone logic in scorer.py
+- Don't put scoring aggregation logic in any provider
 
 ---
 
 ## Future Vision (HazardBeta Platform)
-FloodBeta is module one of a planned HazardBeta platform. Future repos under a HazardBeta GitHub organization:
-
 ```
-HazardBeta (umbrella org / landing page)
+HazardBeta (umbrella org)
 ├── FloodBeta       ← this repo
-├── FireBeta        (wildfire exposure — USGS/CAL FIRE data)
-├── QuakeBeta       (seismic exposure — USGS ShakeMap)
-├── hazardbeta-core (shared library — base classes, geocoder utils, scorer primitives)
+├── FireBeta        (wildfire — USGS/CAL FIRE)
+├── QuakeBeta       (seismic — USGS ShakeMap)
+└── hazardbeta-core (shared base classes, geocoder utils)
 ```
 
-Adjacent product concepts (separate products, not HazardBeta modules):
-- Agricultural/commodity climate impact tool ("HarvestBeta") — answers questions like
-  "how did spring drought impact the peach harvest and hence futures prices?"
-  Fundamentally different data model and user; keep separate.
+Additional location sources on the roadmap:
+- EIA plant-level data (energy sector)
+- SEC EDGAR lease exhibits (deeper parsing)
 
-Architecture decisions in FloodBeta should not block these expansions, but should not
-prematurely implement them either.
+Adjacent product concept: HarvestBeta (agricultural/commodity climate impact) — separate product, not a HazardBeta module.
 
 ---
 
 ## README Tone
-The README.md should be written like a product brief, not a code readme. It should explain:
-1. What problem this solves and for whom
-2. How the FloodBeta score works (methodology — both layers)
-3. How to run it locally
-4. Current data provider (FEMA) and limitations
-5. Future directions (reference HazardBeta vision)
-
-Avoid: "This is a Python script that..."
-Prefer: "FloodBeta helps investors quantify..."
+Product brief style. Explain what problem it solves, how the score works, how to run it, and limitations. Avoid "This is a Python script that..." — prefer "FloodBeta helps investors quantify..."
