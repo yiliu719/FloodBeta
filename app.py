@@ -20,8 +20,9 @@ import pydeck as pdk
 import streamlit as st
 from dotenv import load_dotenv
 
-from floodbeta import edgar, flood_data, scorer
-from floodbeta.providers.fema import FEMAFloodProvider
+from floodbeta import flood_data, scorer
+from floodbeta.providers.flood.fema import FEMAFloodProvider
+from floodbeta.providers.locations import edgar
 
 # SEC and Nominatim both reject requests without a descriptive, contactable
 # user agent. See .env.example.

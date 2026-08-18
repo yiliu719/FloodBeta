@@ -18,8 +18,10 @@ import pytest
 import requests
 from geopy.exc import GeocoderTimedOut
 
-from floodbeta import edgar, flood_data, geocoder, scorer
-from floodbeta.providers import base, fema
+from floodbeta import flood_data, geocoder, scorer
+from floodbeta.providers.flood import base, fema
+from floodbeta.providers.locations import base as locations_base
+from floodbeta.providers.locations import edgar
 
 # Hero demo ticker and validation ticker. Tesla's Gigafactories should surface
 # CA / TX / NV / NY; Lockheed Martin discloses facilities across many states.
@@ -257,7 +259,7 @@ TSLA_COORDS = [
 
 
 def _assert_valid_risk_point(point, lat, lon):
-    """A RiskPoint must satisfy the schema in providers/base.py."""
+    """A RiskPoint must satisfy the schema in providers/flood/base.py."""
     assert set(point) == {"lat", "lon", "risk_score", "risk_label", "source", "raw"}
     assert point["lat"] == lat and point["lon"] == lon
     assert isinstance(point["risk_score"], float)
@@ -433,6 +435,71 @@ def test_provider_implements_the_base_interface():
 
     assert isinstance(provider, base.FloodDataProvider)
     assert provider.get_provider_name() == "FEMA"
+
+
+# --- EdgarLocationProvider (AssetLocationProvider migration) ------------------
+
+FACILITY_KEYS = {"name", "address", "lat", "lon", "source", "raw"}
+
+
+def test_edgar_implements_the_location_provider_interface():
+    provider = edgar.EdgarLocationProvider()
+
+    assert isinstance(provider, locations_base.AssetLocationProvider)
+    assert provider.get_provider_name() == "SEC EDGAR"
+
+
+def test_filing_info_is_none_before_any_lookup():
+    """Provenance is a side effect of get_facilities, not available before."""
+    assert edgar.EdgarLocationProvider().get_filing_info() is None
+
+
+def test_edgar_get_facilities_returns_facility_schema():
+    provider = edgar.EdgarLocationProvider()
+    facilities = provider.get_facilities("$TSLA")
+
+    print(f"\n{'=' * 70}")
+    print(f"EdgarLocationProvider.get_facilities('$TSLA') — {len(facilities)}")
+    print(f"{'-' * 70}")
+    for facility in facilities:
+        print(f"  {facility['address']:<26} {facility['name'] or '—'}")
+    print(f"{'-' * 70}")
+    print(f"filing_info: {provider.get_filing_info()}")
+
+    assert facilities, "expected at least one TSLA facility"
+    for facility in facilities:
+        assert set(facility) == FACILITY_KEYS
+        assert facility["source"] == "SEC EDGAR"
+        assert isinstance(facility["address"], str) and facility["address"]
+        assert facility["name"] is None or isinstance(facility["name"], str)
+        # EDGAR gives city/state only — never coordinates.
+        assert facility["lat"] is None and facility["lon"] is None
+        assert isinstance(facility["raw"], dict)
+
+    info = provider.get_filing_info()
+    assert set(info) == {"ticker", "company", "form", "filing_date", "url"}
+    assert info["ticker"] == "TSLA"
+
+
+def test_edgar_facilities_match_the_legacy_report():
+    """The migration must not change which facilities are extracted."""
+    provider = edgar.EdgarLocationProvider()
+
+    migrated = [f["address"] for f in provider.get_facilities("$TSLA")]
+    legacy = edgar.get_facility_report("$TSLA")["addresses"]
+
+    assert migrated == legacy
+
+
+def test_empty_facility_name_becomes_none():
+    """extract_facilities uses ""; the Facility schema wants None."""
+    provider = edgar.EdgarLocationProvider()
+
+    facilities = provider.get_facilities("$LMT")
+
+    # LMT's Item 2 is prose bullets that name no individual facilities.
+    assert all(f["name"] is None for f in facilities)
+    assert not any(f["name"] == "" for f in facilities)
 
 
 # --- Scoring, offline (no network) -------------------------------------------

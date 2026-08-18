@@ -7,7 +7,7 @@ FloodDataProvider, and returns a list of normalized RiskPoints ready for
 scorer.py. Contains no provider-specific logic and no scoring aggregation.
 
 **Sole owner of the `geocoded` field contract** described in
-providers/base.py. Providers never set `geocoded` — a provider only returns
+providers/flood/base.py. Providers never set `geocoded` — a provider only returns
 a RiskPoint for a coordinate it was handed, so the value is always True at
 that layer and omitting it is correct. This module sits above the providers
 and is the only place that knows a geocode failed, so it is the only place
@@ -18,7 +18,7 @@ field; scorer.py only reads it, treating an absent key as True.
 from __future__ import annotations
 
 from . import geocoder
-from .providers.base import FloodDataProvider, RiskPoint
+from .providers.flood.base import FloodDataProvider, RiskPoint
 
 # Placeholder score for a facility that never got a coordinate. Deliberately
 # matches the "no data" convention rather than implying safety — though it is

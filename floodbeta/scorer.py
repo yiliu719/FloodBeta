@@ -44,8 +44,8 @@ def _is_scorable(point: dict) -> bool:
     mean at the provider's "Unknown" value (0.1) would quietly drag the
     score toward that number and misreport a data gap as a finding.
 
-    `geocoded` is absent from the RiskPoint schema in providers/base.py, so
-    a point without it is assumed geocoded — a provider only returns a
+    `geocoded` is absent from the RiskPoint schema in providers/flood/base.py,
+    so a point without it is assumed geocoded — a provider only returns a
     RiskPoint for a coordinate it was given.
     """
     if not point.get("geocoded", True):

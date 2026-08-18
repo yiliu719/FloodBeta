@@ -15,6 +15,10 @@ Extraction is heuristic. 10-K property tables rarely give street addresses;
 they usually give "City, State", which is sufficient granularity for
 geocoding. Callers should treat the output as candidate locations to be
 verified, not ground truth.
+
+Implements AssetLocationProvider via EdgarLocationProvider at the bottom of
+this module. The parsing functions above it are the implementation detail and
+remain importable for testing.
 """
 
 from __future__ import annotations
@@ -25,6 +29,8 @@ import re
 import time
 
 import requests
+
+from .base import AssetLocationProvider, Facility
 
 # --- SEC endpoints -----------------------------------------------------------
 
@@ -519,3 +525,56 @@ def get_facility_report(ticker: str) -> dict:
         "facilities": facilities,
         "addresses": [facility["address"] for facility in facilities],
     }
+
+
+# --- AssetLocationProvider implementation ------------------------------------
+
+PROVIDER_NAME = "SEC EDGAR"
+
+
+class EdgarLocationProvider(AssetLocationProvider):
+    """Facility locations from a company's latest 10-K Item 2 Properties."""
+
+    def __init__(self):
+        self._filing_info: dict | None = None
+
+    def get_provider_name(self) -> str:
+        return PROVIDER_NAME
+
+    def get_facilities(self, ticker: str) -> list[Facility]:
+        """Ticker -> normalized Facility list from the latest 10-K.
+
+        lat/lon are always None: 10-K property disclosures give city and
+        state, never coordinates, so flood_data.py must geocode these.
+
+        Filing provenance is captured as a side effect and read back via
+        get_filing_info(), because the interface gives that method no ticker
+        to look up. Raises EdgarError if the ticker or filing is not found.
+        """
+        report = get_facility_report(ticker)
+
+        self._filing_info = {
+            "ticker": report["ticker"],
+            "company": report["company"],
+            "form": report["form"],
+            "filing_date": report["filing_date"],
+            "url": report["url"],
+        }
+
+        return [
+            {
+                # extract_facilities uses "" for an unnamed facility; the
+                # Facility schema wants None.
+                "name": facility["name"] or None,
+                "address": facility["address"],
+                "lat": None,
+                "lon": None,
+                "source": PROVIDER_NAME,
+                "raw": dict(facility),
+            }
+            for facility in report["facilities"]
+        ]
+
+    def get_filing_info(self) -> dict | None:
+        """Provenance for the most recent get_facilities() call, or None."""
+        return self._filing_info
