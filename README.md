@@ -1,6 +1,6 @@
 # 🌊 FloodBeta
 
-**Physical flood risk exposure for public equities — from SEC-reported facility locations.**
+**Physical flood risk exposure for public equities — from publicly available facility data.**
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/built%20with-Streamlit-red.svg)](https://streamlit.io/)
@@ -15,15 +15,15 @@
 FloodBeta answers a question that most investment workflows currently ignore: **how exposed is a company's physical asset base to flood risk?**
 
 Given a stock ticker, FloodBeta:
-1. Locates the company's facility footprint from publicly available data sources
+1. Locates the company's facility footprint from publicly available data sources (SEC EDGAR or EPA Facility Registry)
 2. Geocodes each location to coordinates
 3. Queries FEMA's National Flood Hazard Layer (NFHL) for the flood zone at each facility
 4. Aggregates results into a single **FloodBeta score** — a 0–1 index of physical flood exposure across the company's asset base
 
 The result is a score, a facility map, and a per-facility breakdown — all traceable back to the original data source.
+
 <img width="1568" height="714" alt="image" src="https://github.com/user-attachments/assets/3059c330-dd3f-4878-b88e-c8224f0e8b5a" />
 <img width="1568" height="307" alt="image" src="https://github.com/user-attachments/assets/e5eb5894-7383-46a7-a5c3-67c78d5b29f3" />
-
 
 ---
 
@@ -57,11 +57,12 @@ The score is provider-agnostic by design: the underlying architecture normalizes
 
 ## Example Results
 
-| Ticker | Company | Facilities | FloodBeta | Label |
-|--------|---------|-----------|-----------|-------|
-| TSLA | Tesla, Inc. | 5 | 0.10 | 🟢 Low |
-| LMT | Lockheed Martin | 22 | 0.14 | 🟢 Low |
-| DAR | Darling Ingredients | 74 | 0.13 | 🟢 Low |
+| Ticker | Company | Source | Facilities | FloodBeta | Label |
+|--------|---------|--------|-----------|-----------|-------|
+| TSLA | Tesla, Inc. | SEC EDGAR | 5 | 0.10 | 🟢 Low |
+| LMT | Lockheed Martin | SEC EDGAR | 22 | 0.14 | 🟢 Low |
+| DAR | Darling Ingredients | SEC EDGAR | 74 | 0.13 | 🟢 Low |
+| DAR | Darling Ingredients | EPA FRS (TX) | 4 | 0.05 | 🟢 Low |
 
 *Tesla's Austin Gigafactory and Lathrop Megafactory both sit behind levees — scored 0.30 (Moderate) individually. Lockheed's Cape Canaveral facility scores 1.0 (High) as a coastal V-zone site, visible as a red pin on the map.*
 
@@ -69,13 +70,14 @@ The score is provider-agnostic by design: the underlying architecture normalizes
 
 ## Data Sources
 
-All current data sources are free and publicly accessible — no API keys required.
+All data sources are free and publicly accessible — no API keys required.
 
 | Source | Use | Notes |
 |--------|-----|-------|
-| [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar) | Facility location extraction | `data.sec.gov/submissions` API |
+| [SEC EDGAR](https://www.sec.gov/cgi-bin/browse-edgar) | Facility location extraction | 10-K Item 2 (Properties) via `data.sec.gov` API |
+| [EPA Facility Registry Service](https://www.epa.gov/frs) | Facility location extraction | ~4M registered US industrial facilities |
 | [FEMA NFHL](https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer) | Flood zone lookup | Layer 28: Flood Hazard Zones |
-| [OpenStreetMap / Nominatim](https://nominatim.openstreetmap.org/) | Geocoding | 1 req/sec rate limit |
+| [OpenStreetMap / Nominatim](https://nominatim.openstreetmap.org/) | Geocoding fallback | Used when provider doesn't supply coordinates |
 
 ---
 
@@ -84,18 +86,19 @@ All current data sources are free and publicly accessible — no API keys requir
 FloodBeta is built around two parallel provider abstractions designed for extensibility:
 
 ```
-Ticker
+Ticker + location source selection
   └─ Asset Location Pipeline
   │    └─ providers/locations/
-  │         ├─ base.py          Abstract AssetLocationProvider
-  │         └─ edgar.py         SEC EDGAR: 10-K Item 2 extraction (current)
+  │         ├─ base.py          Abstract AssetLocationProvider + Facility schema
+  │         ├─ edgar.py         SEC EDGAR: 10-K Item 2 extraction
+  │         └─ epa.py           EPA Facility Registry Service
   │
-  └─ Flood Risk Pipeline  
-       └─ geocoder.py           Address → lat/lon (Nominatim/OSM)
-       └─ flood_data.py         Orchestrates geocoder + flood provider
+  └─ Flood Risk Pipeline
+       └─ geocoder.py           Address → lat/lon (Nominatim fallback only)
+       └─ flood_data.py         Orchestrates location provider + flood provider
        └─ providers/flood/
        │    ├─ base.py          Abstract FloodDataProvider + RiskPoint schema
-       │    └─ fema.py          FEMA NFHL implementation (current)
+       │    └─ fema.py          FEMA NFHL implementation
        └─ scorer.py             Provider-agnostic aggregation (0–1 floats only)
        └─ app.py                Streamlit UI
 ```
@@ -140,17 +143,23 @@ python -m pytest tests/ -s
 
 ## Limitations
 
-**Facility location coverage**
-The current implementation extracts facility locations from SEC 10-K filings (Item 2: Properties). This works well for capital-intensive companies that enumerate specific locations — manufacturers, defense contractors, industrials. It works less well for holding companies, pure-play tech, and retailers that describe properties in aggregate prose. Future releases will supplement SEC data with additional public sources (see Roadmap).
+**Facility location coverage (SEC EDGAR)**
+EDGAR extraction works well for capital-intensive companies that enumerate specific facility locations in their 10-K Item 2 section — manufacturers, defense contractors, industrials. It works less well for holding companies, pure-play tech, and retailers that describe properties in aggregate prose.
+
+**Facility location coverage (EPA FRS)**
+EPA name matching can be noisy for common consumer brand names — results may include third-party businesses registered under similar names (e.g. searching "Tesla" returns PG&E substations and a mine containing the word "Tesla"). The UI warns when result counts are high. EPA FRS requires searching by state; nationwide search costs ~52 API requests and takes approximately 4–5 minutes. Scores from EDGAR and EPA FRS are not directly comparable — they reflect different facility populations.
 
 **Geocoding precision**
-All locations resolve to city centroids, not building coordinates. A city centroid may fall in a different FEMA flood zone than the actual facility. This limitation is disclosed in the UI on every result. Street-level geocoding via OpenStreetMap Overpass API is planned for named facilities.
+SEC EDGAR locations resolve to city centroids — a centroid may fall in a different FEMA flood zone than the actual facility. EPA FRS supplies pre-geocoded facility-level coordinates for most records, which are used directly without re-geocoding. The UI reports precision per facility (facility-level vs. city-level) so users can assess result quality.
+
+**Score reproducibility**
+Scores may vary slightly between runs for SEC EDGAR results due to city-centroid geocoding — Nominatim occasionally returns slightly different centroids for the same city/state input.
 
 **US facilities only**
 FEMA NFHL covers the United States only. International facility locations are extracted but cannot be flood-scored and are marked Unknown.
 
 **Spelling in source filings**
-Location extraction depends on correct spelling in the source document. Misspellings in SEC filings will fail geocoding and be flagged as unresolved in the results table.
+Location extraction depends on correct spelling in the source document. Misspellings in SEC filings will fail geocoding and be flagged as unresolved.
 
 ---
 
@@ -159,11 +168,10 @@ Location extraction depends on correct spelling in the source document. Misspell
 FloodBeta is the first module of a planned **HazardBeta** platform — a physical risk intelligence suite for public equities.
 
 **FloodBeta — Near Term**
-- [ ] Additional facility location sources:
-  - EPA Facility Registry Service (FRS) — free, covers ~4M US industrial facilities
-  - EIA plant-level location data — energy sector
-  - SEC EDGAR lease exhibits — deeper parsing of the same filings
+- [x] EPA Facility Registry Service (FRS) — free, ~4M US industrial facilities
 - [ ] Street-level geocoding via OSM Overpass API for named facilities
+- [ ] EIA plant-level location data — energy sector
+- [ ] SEC EDGAR lease exhibits — deeper parsing of the same filings
 - [ ] Facility weighting by revenue or asset value
 
 **FloodBeta — Flood Data Providers**
@@ -179,15 +187,15 @@ FloodBeta is the first module of a planned **HazardBeta** platform — a physica
 
 ## About
 
-Built by [Yi Liu](https://www.linkedin.com/in/yi-liu-484321b5/) as a proof-of-concept 
-exploring how physical climate risk data can be surfaced in an 
+Built by [Yi Liu](https://www.linkedin.com/in/yi-liu-484321b5/) as a proof-of-concept
+exploring how physical climate risk data can be surfaced in an
 investment workflow.
 
-Yi is a coastal engineer and Columbia Business School MBA candidate 
-(Class of 2028) with a background in flood modeling, storm surge 
-forecasting, and climate risk quantification. FloodBeta is a 
-side project applying that domain expertise to a product question: 
-what would a physical risk screener for public equities look like 
+Yi is a coastal engineer and Columbia Business School MBA candidate
+(Class of 2028) with a background in flood modeling, storm surge
+forecasting, and climate risk quantification. FloodBeta is a
+side project applying that domain expertise to a product question:
+what would a physical risk screener for public equities look like
 if it were built on open data?
 
 Feedback and contributions welcome.
