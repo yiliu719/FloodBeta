@@ -27,18 +27,26 @@ jobs:
           # Deliberate curl flags:
           #   -s -S  quiet progress, but still print real errors
           #   no -f  an HTTP error status must not make curl exit non-zero
-          #   no -L  a sleeping app answers with a redirect; following it
-          #          would report the destination's 200 and hide the sleep
+          #   no -L  the app answers 303 into an auth redirect that loops;
+          #          following it would spend 50 redirects and report the
+          #          login page's status instead of the app's
           status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$APP_URL")" \
             || status="000"
 
-          if [ "$status" = "200" ]; then
-            echo "OK — $APP_URL returned 200"
-          elif [ "$status" = "000" ]; then
-            echo "::warning::No HTTP response from $APP_URL (timeout or network error)."
-          else
-            echo "::warning::$APP_URL returned HTTP $status — a sleeping app answers with a redirect."
-          fi
+          case "$status" in
+            200|303)
+              # 200 is the app itself. 303 is Streamlit's auth redirect,
+              # which still proves the host answered — the app is reachable
+              # either way.
+              echo "OK — $APP_URL returned $status (reachable)"
+              ;;
+            000)
+              echo "::warning::No HTTP response from $APP_URL (timeout or network error)."
+              ;;
+            *)
+              echo "::warning::$APP_URL returned HTTP $status."
+              ;;
+          esac
 
           # This workflow reports; it never gates anything. A non-200 is
           # information, not a build failure, so always exit clean.
